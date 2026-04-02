@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""CLI tool to browse and resume Claude Code sessions."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+LOG_DIR = Path.home() / ".claude" / "session-logs"
+
+# ANSI colors
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def load_sessions(from_date=None, to_date=None, search=None):
+    """Load all session metadata files, optionally filtered by date range or search term."""
+    sessions = []
+    if not LOG_DIR.exists():
+        return sessions
+
+    for f in LOG_DIR.glob("*.json"):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+                sessions.append(data)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    # Sort by date descending
+    sessions.sort(key=lambda s: s.get("date", ""), reverse=True)
+
+    # Apply date filters
+    if from_date:
+        sessions = [s for s in sessions if s.get("date", "")[:10] >= from_date]
+    if to_date:
+        sessions = [s for s in sessions if s.get("date", "")[:10] <= to_date]
+
+    # Apply text search on preview and cached summaries
+    if search:
+        term = search.lower()
+        filtered = []
+        for s in sessions:
+            preview = s.get("preview", "").lower()
+            summaries = " ".join(s.get("summaries", [])).lower()
+            if term in preview or term in summaries:
+                filtered.append(s)
+        sessions = filtered
+
+    return sessions
+
+
+def print_sessions(sessions, limit=None):
+    """Print session list as a formatted table."""
+    if not sessions:
+        print(f"  {DIM}No sessions found.{RESET}")
+        return
+
+    if limit:
+        sessions = sessions[:limit]
+
+    # Table header
+    print()
+    print(f"  {BOLD}{'#':>3}  {'Date':<12} {'Turns':>5} {'Topics':>6}  {'Directory':<30} {'Preview'}{RESET}")
+    print(f"  {'─'*3}  {'─'*12} {'─'*5} {'─'*6}  {'─'*30} {'─'*40}")
+
+    for i, s in enumerate(sessions, 1):
+        date = s.get("date", "?")[:10]
+        turns = s.get("turns", "?")
+        segments = s.get("segments", 1)
+        cwd = s.get("cwd", "?")
+        orphan = not os.path.isfile(s.get("transcript_path", ""))
+        # Shorten home path
+        cwd = cwd.replace(str(Path.home()), "~")
+        if len(cwd) > 30:
+            cwd = "..." + cwd[-27:]
+        preview = s.get("preview", "")[:40]
+        if len(s.get("preview", "")) > 40:
+            preview += "..."
+
+        # Mark orphan sessions
+        marker = f"{RED}!{RESET}" if orphan else " "
+        print(f"  {CYAN}{i:>3}{RESET}{marker} {date:<12} {turns:>5} {segments:>6}  {DIM}{cwd:<30}{RESET} {preview}")
+
+    print()
+
+
+def save_session(session):
+    """Persist session metadata back to its JSON file."""
+    log_file = LOG_DIR / f"{session['session_id']}.json"
+    with open(log_file, "w") as f:
+        json.dump(session, f, indent=2, ensure_ascii=False)
+
+
+def split_transcript_segments(transcript_path):
+    """Split a transcript into segments divided by /clear commands."""
+    segments = []
+    current = []
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    # Detect /clear
+                    if entry.get("type") == "user":
+                        content = entry.get("message", {}).get("content", "")
+                        if isinstance(content, str) and "<command-name>/clear</command-name>" in content:
+                            if current:
+                                segments.append("\n".join(current))
+                            current = []
+                            continue
+                    current.append(line.strip())
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    if current:
+        segments.append("\n".join(current))
+    return segments if segments else [""]
+
+
+def call_haiku(content, prompt):
+    """Call Haiku via claude CLI and return the response."""
+    try:
+        env = os.environ.copy()
+        env["SESSION_LOG_RUNNING"] = "1"
+        # Truncate to last 20000 chars
+        if len(content) > 20000:
+            content = content[-20000:]
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku", prompt],
+            input=content,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def get_summaries(session):
+    """Return cached summaries or generate per-segment summaries with Haiku."""
+    # Return cached summaries if segment count matches
+    if session.get("summaries") and len(session["summaries"]) == session.get("segments", 1):
+        return session["summaries"]
+
+    transcript_path = session.get("transcript_path", "")
+    if not transcript_path or not os.path.isfile(transcript_path):
+        print(f"  {YELLOW}Transcript not found (orphan session).{RESET}")
+        return None
+
+    segments = split_transcript_segments(transcript_path)
+    total = len(segments)
+
+    prompt = (
+        "Generate a concise summary in Spanish of this Claude Code conversation segment. Format:\n"
+        "- **Tópico principal**: (one line)\n"
+        "- **Resumen**: (2-5 bullets with the most important points)\n"
+        "- **Estado**: (en progreso / completado / bloqueado)\n"
+        "Only output the summary, no metadata."
+    )
+
+    print(f"  {DIM}Generating summaries for {total} topic(s)...{RESET}")
+
+    summaries = []
+    for i, segment in enumerate(segments):
+        if not segment.strip():
+            summaries.append("(empty segment)")
+            continue
+        print(f"  {DIM}  Topic {i + 1}/{total}...{RESET}")
+        result = call_haiku(segment, prompt)
+        summaries.append(result if result else "(could not generate summary)")
+
+    # Cache summaries
+    session["summaries"] = summaries
+    save_session(session)
+    return summaries
+
+
+def cleanup_sessions(days):
+    """Remove session logs older than the specified number of days."""
+    if not LOG_DIR.exists():
+        print(f"  {DIM}No session logs directory found.{RESET}")
+        return
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    removed = 0
+    orphaned = 0
+
+    for f in list(LOG_DIR.glob("*.json")):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+            session_date = data.get("date", "")[:10]
+            transcript = data.get("transcript_path", "")
+            is_orphan = transcript and not os.path.isfile(transcript)
+
+            if session_date < cutoff or is_orphan:
+                f.unlink()
+                if is_orphan:
+                    orphaned += 1
+                else:
+                    removed += 1
+        except (json.JSONDecodeError, OSError):
+            f.unlink()
+            removed += 1
+
+    print(f"  Removed {removed} session(s) older than {days} days.")
+    if orphaned:
+        print(f"  Removed {orphaned} orphan session(s) (transcript deleted).")
+
+
+def interactive_select(sessions):
+    """Let the user pick a session to view details and get resume command."""
+    while True:
+        print_sessions(sessions)
+        try:
+            choice = input(f"  {BOLD}Select a session (number) or 'q' to quit:{RESET} ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        if choice.lower() == "q":
+            break
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                session = sessions[idx]
+                sid = session["session_id"]
+
+                print()
+                summaries = get_summaries(session)
+                if summaries:
+                    for i, summary in enumerate(summaries):
+                        if len(summaries) > 1:
+                            print(f"  {BOLD}{CYAN}Topic {i + 1}/{len(summaries)}:{RESET}")
+                        print(f"  {summary}")
+                        print()
+                else:
+                    print(f"  {YELLOW}Could not generate summaries.{RESET}")
+                    print()
+
+                print(f"  {BOLD}To resume:{RESET} {GREEN}claude --resume {sid}{RESET}")
+                print()
+            else:
+                print(f"  {YELLOW}Invalid number.{RESET}")
+        except ValueError:
+            print(f"  {YELLOW}Enter a number or 'q'.{RESET}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Browse and resume Claude Code sessions")
+    parser.add_argument("--all", action="store_true", help="Show all sessions (default: last 10)")
+    parser.add_argument("--from", dest="from_date", help="Filter from date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="to_date", help="Filter to date (YYYY-MM-DD)")
+    parser.add_argument("--search", "-s", help="Search sessions by keyword (matches preview and cached summaries)")
+    parser.add_argument("--cleanup", type=int, metavar="DAYS", help="Remove session logs older than DAYS days (also removes orphan sessions)")
+    args = parser.parse_args()
+
+    # Cleanup mode
+    if args.cleanup is not None:
+        cleanup_sessions(args.cleanup)
+        return
+
+    sessions = load_sessions(from_date=args.from_date, to_date=args.to_date, search=args.search)
+
+    limit = None if args.all or args.from_date or args.to_date or args.search else 10
+
+    if sessions:
+        displayed = sessions[:limit] if limit else sessions
+        interactive_select(displayed)
+    else:
+        print(f"\n  {DIM}No sessions found.{RESET}\n")
+
+
+if __name__ == "__main__":
+    main()
